@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional, NamedTuple
 import dataclasses
 from scipy import sparse
 from scipy.sparse import dia_matrix
+import json
 import numpy as np
 import copy
 import os
@@ -19,7 +20,7 @@ from rclpy.parameter import Parameter
 from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from std_msgs.msg import Empty, Bool, Float32MultiArray, Int32
+from std_msgs.msg import Empty, Bool, Float32MultiArray, Int32, Float64MultiArray, String
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion, Pose2D, Point, Vector3
 from std_msgs.msg import ColorRGBA
@@ -111,6 +112,8 @@ class MPCConfig:
     steer_low_pass_gain: float
     wp_id_offset: int
     use_max_kappa_pred: bool
+    raceline_blend_ratio: float
+    friction_coefficient: float
 
 
 class MPCController(Node):
@@ -238,6 +241,8 @@ class MPCController(Node):
             self.declare_parameter("accel_low_pass_gain", mpc_cfg.accel_low_pass_gain)
             self.declare_parameter("steer_low_pass_gain", mpc_cfg.steer_low_pass_gain)
             self.declare_parameter("wp_id_offset", mpc_cfg.wp_id_offset)
+            self.declare_parameter("raceline_blend_ratio", mpc_cfg.raceline_blend_ratio)
+            self.declare_parameter("friction_coefficient", mpc_cfg.friction_coefficient)
 
         def param_cb(parameters):
             cfg_mpc = self._cfg.mpc # type: ignore
@@ -261,8 +266,11 @@ class MPCController(Node):
                 self._mpc.update_QN(mpc_cfg.QN)
                 self.get_logger().warn(f"QN[{index}] was updated to '{value}'")
 
+            ref_vel_changed = False
             for param in parameters:
-                if param.name == "v_max" and param.type_ == Parameter.Type.DOUBLE:
+                if param.name.startswith("ref_vel/"):
+                    ref_vel_changed = True
+                elif param.name == "v_max" and param.type_ == Parameter.Type.DOUBLE:
                     mpc_cfg.v_max = param.value
                     self._mpc.update_v_max(kmh_to_m_per_sec(param.value))
                     v_ref: List[float] = [kmh_to_m_per_sec(param.value)] * len(self._reference_path.waypoints)
@@ -312,6 +320,18 @@ class MPCController(Node):
                     self._mpc.update_wp_id_offset(param.value)
                     self.get_logger().warn(f"wp_id_offset was updated to '{param.value}'")
 
+                elif param.name == "raceline_blend_ratio" and param.type_ == Parameter.Type.DOUBLE:
+                    mpc_cfg.raceline_blend_ratio = param.value
+                    self._mpc.raceline_blend_ratio = param.value
+                    self.get_logger().warn(f"raceline_blend_ratio was updated to '{param.value}'")
+
+                elif param.name == "friction_coefficient" and param.type_ == Parameter.Type.DOUBLE:
+                    mpc_cfg.friction_coefficient = param.value
+                    self.get_logger().warn(f"friction_coefficient was updated to '{param.value}'")
+                    ref_vel_changed = True
+
+            if ref_vel_changed:
+                self._update_waypoint_velocities()
 
             return SetParametersResult(successful=True)
 
@@ -367,11 +387,14 @@ class MPCController(Node):
 
         def create_car(ref_path: ReferencePath) -> BicycleModel:
             cfg_model = self._cfg.bicycle_model # type: ignore
-            return BicycleModel(
+            car = BicycleModel(
                 ref_path,
                 cfg_model.length,
                 cfg_model.width,
                 1.0 / self._cfg.mpc.control_rate) # type: ignore
+            car.a_min = self._cfg.mpc.a_min
+            car.a_max = self._cfg.mpc.a_max
+            return car
 
         def create_mpc(car: BicycleModel) -> Tuple[MPCConfig, MPC]:
             cfg_mpc = self._cfg.mpc # type: ignore
@@ -392,7 +415,9 @@ class MPCController(Node):
                 cfg_mpc.accel_low_pass_gain,
                 cfg_mpc.steer_low_pass_gain,
                 cfg_mpc.wp_id_offset,
-                cfg_mpc.use_max_kappa_pred)
+                cfg_mpc.use_max_kappa_pred,
+                cfg_mpc.raceline_blend_ratio,
+                cfg_mpc.friction_coefficient)
 
             state_constraints = {
                 "xmin": np.array([-np.inf, -np.inf, -np.inf]),
@@ -418,7 +443,8 @@ class MPCController(Node):
                 mpc_cfg.wp_id_offset,
                 self.USE_OBSTACLE_AVOIDANCE,
                 self._cfg.reference_path.use_path_constraints_topic,
-                mpc_cfg.use_max_kappa_pred)
+                mpc_cfg.use_max_kappa_pred,
+                mpc_cfg.raceline_blend_ratio)
 
             return mpc_cfg, mpc
 
@@ -437,9 +463,15 @@ class MPCController(Node):
         self._reference_path = create_ref_path(self._map)
         self._car = create_car(self._reference_path)
         self._mpc_cfg, self._mpc = create_mpc(self._car)
-        compute_speed_profile(self._car, self._mpc_cfg)
 
+        # Create ref_vel_configulator FIRST so we know whether a custom profile exists.
+        # Only fall back to the OSQP-based compute_speed_profile when no custom profile
+        # is configured — the curvature-aware profile built by _update_waypoint_velocities()
+        # is more accurate and will overwrite it anyway.
         self._ref_vel_configulator: Optional[ReferenceVelocityConfigulator] = create_ref_vel_configulator()
+        if self._ref_vel_configulator is None:
+            compute_speed_profile(self._car, self._mpc_cfg)
+        self._update_waypoint_velocities()
 
         self._trajectory: Optional[Trajectory] = None
         self._path_constraints = None
@@ -448,7 +480,10 @@ class MPCController(Node):
         if self.USE_OBSTACLE_AVOIDANCE:
             self._static_obstacles: List[Obstacle] = create_obstacles()
             self._dynamic_obstacles: List[Obstacle] = []
+            self._detected_obstacles: List[Obstacle] = []
+            self._last_obstacles_msgs_raw = None
             self._obstacles_updated = bool(self._static_obstacles)
+            self._latest_opponent_forecast = None
             v2x_cfg = self._cfg.v2x_obstacle_avoidance  # type: ignore
             self._v2x_tracker = V2XVehicleTracker(
                 v_max_safety=float(v2x_cfg.v_max_safety),
@@ -480,12 +515,79 @@ class MPCController(Node):
         self._last_condition = None
         self._last_colliding_time = None
 
+        # reverse recovery state
+        self._stuck_ticks = 0
+        self._reverse_ticks = 0
+        self._reverse_steer_dir = 1.0
+        self._was_reversing = False
+
         # stats
         self._stats = ExecutionStats(self.get_logger(), window_size=50, record_count_threshold=1000)
 
         # save config
         if self._cfg.common.save_config:
             self._save_config()
+
+    def _update_waypoint_velocities(self) -> None:
+        ay_max = self._mpc_cfg.ay_max
+        v_ref = []
+        for i, wp in enumerate(self._reference_path.waypoints):
+            if self._ref_vel_configulator is not None:
+                ref_vel_kmph = self._ref_vel_configulator.get_ref_vel(i)
+                section_speed_ms = min(
+                    kmh_to_m_per_sec(ref_vel_kmph),
+                    self._mpc_cfg.v_max
+                )
+            else:
+                section_speed_ms = self._mpc_cfg.v_max
+            
+            # Use the CSV kappa (already smooth, matches MPC runtime kappa_ref)
+            # to calculate dynamic curvature speed ceiling
+            kappa_abs = abs(wp.kappa) if wp.kappa is not None else 0.0
+            # Use 75% of ay_max for the speed profile to give the MPC solver steering headroom!
+            # If they are exactly the same, the solver's steering constraint will lock up at high speeds
+            # causing the kart to understeer (wobble) when it enters the turn slightly too fast.
+            v_max_kappa = np.sqrt((ay_max * 0.75) / (kappa_abs + 1e-9))
+            v_ref.append(min(section_speed_ms, v_max_kappa))
+        self._reference_path.set_v_ref(v_ref)
+        self._smooth_and_clip_speed_profile()
+
+    def _smooth_and_clip_speed_profile(self) -> None:
+        waypoints = self._car.reference_path.waypoints
+        n = len(waypoints)
+        if n < 2:
+            return
+
+        max_accel = self._mpc_cfg.a_max
+        # Use a more conservative deceleration for the speed profile so the kart starts braking
+        # earlier and doesn't hit the physical limit (a_min) and overshoot into corners.
+        max_decel = abs(self._mpc_cfg.a_min) * 0.65
+
+        # Snapshot the per-waypoint curvature ceiling BEFORE the backward pass
+        curvature_ceiling = [wp.v_ref for wp in waypoints]
+
+        # Perform 2 passes for seamless circular wrap-around consistency
+        is_circular = getattr(self._reference_path, 'circular', True)
+        passes = 2 if is_circular else 1
+
+        for _ in range(passes):
+            # Backward pass: ensure braking is physically achievable before a corner
+            for i in range(n - 1, -1, -1):
+                next_i = (i + 1) % n if is_circular else min(i + 1, n - 1)
+                dist = np.hypot(waypoints[next_i].x - waypoints[i].x, waypoints[next_i].y - waypoints[i].y)
+                max_reachable = np.sqrt(
+                    waypoints[next_i].v_ref**2 + 2 * max_decel * dist
+                )
+                waypoints[i].v_ref = min(waypoints[i].v_ref, max_reachable)
+
+            # Forward pass: accelerate back up to the curvature ceiling on straights
+            for i in range(n):
+                prev_i = (i - 1) % n if is_circular else max(i - 1, 0)
+                dist = np.hypot(waypoints[i].x - waypoints[prev_i].x, waypoints[i].y - waypoints[prev_i].y)
+                max_reachable = np.sqrt(
+                    waypoints[prev_i].v_ref**2 + 2 * max_accel * dist
+                )
+                waypoints[i].v_ref = min(curvature_ceiling[i], max_reachable)
 
     def _save_config(self) -> None:
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -501,9 +603,10 @@ class MPCController(Node):
         else:
           self._command_pub = self.create_publisher(
             AckermannControlCommand, "/control/command/control_cmd", 1)
-          self._command_raw_pub = self.create_publisher(
-            AckermannControlCommand, "/control/command/control_cmd_raw", 1)
           print("use normal ackermann control command")
+
+        self._command_raw_pub = self.create_publisher(
+          AckermannControlCommand, "/control/command/control_cmd_raw", 1)
 
         # NOTE:評価環境での可視化のためにダミーのトピック名を使用
         self._mpc_pred_pub = self.create_publisher(
@@ -522,7 +625,9 @@ class MPCController(Node):
         self._odom_sub = self.create_subscription(
             Odometry, "/localization/kinematic_state", self._odom_callback, 1)
         self._control_mode_request_sub = self.create_subscription(
-            Bool, "control/control_mode_request_topic", self._control_mode_request_callback, 1)
+            Bool, "/awsim/control_mode_request_topic", self._control_mode_request_callback, 1)
+        self._control_mode_request_sub_alt = self.create_subscription(
+            Bool, "/control/control_mode_request_topic", self._control_mode_request_callback, 1)
         # simple_trajectory_generator publishes with BEST_EFFORT/KEEP_LAST(1) — match it
         # so the subscription is QoS-compatible (rclpy default is RELIABLE).
         trajectory_qos = QoSProfile(
@@ -550,10 +655,17 @@ class MPCController(Node):
                 self._border_cells_sub = self.create_subscription(
                     BorderCells, "/path_constraints_provider/border_cells", self._border_cells_callback, 1)
 
-            self._v2x_sub = self.create_subscription(
-                V2XVehiclePositionArray,
-                "/v2x/vehicle_positions",
-                self._v2x_callback,
+            if not self._cfg.reference_path.use_path_constraints_topic: # type: ignore
+                self._obstacles_sub = self.create_subscription(
+                    Float64MultiArray,
+                    "/aichallenge/objects",
+                    self._obstacles_callback,
+                    1)
+
+            self._forecast_sub = self.create_subscription(
+                String,
+                "/opponent_forecast",
+                self._forecast_callback,
                 1)
 
     def _create_ackerman_control_command(self, stamp, u, acc, bug_acc_enabled):
@@ -574,12 +686,18 @@ class MPCController(Node):
         cmd = self._create_ackerman_control_command(stamp, u, acc, bug_acc_enabled)
 
         # publish raw control command
-        self._command_raw_pub.publish(cmd)
+        if self.USE_BUG_ACC:
+            self._command_raw_pub.publish(cmd.command)
+        else:
+            self._command_raw_pub.publish(cmd)
 
         # compensate steering angle for the real vehicle
         # AWSIMにおいても後段のactuation_cmd_converter でgainを考慮した指令を生成するため、実機/sim問わず
         # gain を掛ける
-        cmd.lateral.steering_tire_angle *= self._mpc_cfg.steering_tire_angle_gain_var
+        if self.USE_BUG_ACC:
+            cmd.command.lateral.steering_tire_angle *= self._mpc_cfg.steering_tire_angle_gain_var
+        else:
+            cmd.lateral.steering_tire_angle *= self._mpc_cfg.steering_tire_angle_gain_var
         self._command_pub.publish(cmd)
 
 
@@ -595,12 +713,38 @@ class MPCController(Node):
         self._reference_path.set_path_constraints(
             msg.upper_bounds, msg.lower_bounds, msg.rows, msg.cols)
 
-    def _v2x_callback(self, msg: V2XVehiclePositionArray) -> None:
-        self._v2x_tracker.update(msg)
-        predictions = self._v2x_tracker.predict_all(self._v2x_t_samples)
-        self._dynamic_obstacles = predictions_to_obstacles(
-            predictions, self._v2x_vehicle_radius)
-        self._obstacles_updated = True
+    def _forecast_callback(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+            self._latest_opponent_forecast = data
+            
+            predictions = data.get('opponents', {})
+            self._dynamic_obstacles = []
+            for vid, path in predictions.items():
+                for pt in path:
+                    self._dynamic_obstacles.append(Obstacle(cx=pt[0], cy=pt[1], radius=self._v2x_vehicle_radius))
+            
+            recommended_side = data.get('recommended_pass_side', 'none')
+            if recommended_side != 'none':
+                effective_blend = 0.35
+            else:
+                effective_blend = float(self._cfg.mpc.raceline_blend_ratio) # type: ignore
+                
+            self._mpc.raceline_blend_ratio = effective_blend
+            self._obstacles_updated = True
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse opponent forecast: {e}")
+
+    def _obstacles_callback(self, msg: Float64MultiArray) -> None:
+        obstacles_updated = (self._last_obstacles_msgs_raw != msg.data) and (len(msg.data) > 0)
+        if obstacles_updated:
+            self._last_obstacles_msgs_raw = msg.data
+            self._detected_obstacles = []
+            for i in range(0, len(msg.data), 4):
+                x = msg.data[i]
+                y = msg.data[i + 1]
+                self._detected_obstacles.append(Obstacle(cx=x, cy=y, radius=float(self._cfg.obstacles.radius))) # type: ignore
+            self._obstacles_updated = True
 
     def _filter_obstacles_to_corridor(self, obstacles: List[Obstacle]) -> List[Obstacle]:
         if not obstacles or self._waypoint_xy.size == 0:
@@ -608,7 +752,12 @@ class MPCController(Node):
         thr_sq = self._v2x_corridor_threshold_sq
         wps = self._waypoint_xy
         kept: List[Obstacle] = []
+        car_x = getattr(self._car.temporal_state, 'x', None)
+        car_y = getattr(self._car.temporal_state, 'y', None)
         for ob in obstacles:
+            if car_x is not None and car_y is not None:
+                if math.hypot(ob.cx - car_x, ob.cy - car_y) < 0.8:
+                    continue
             dxy = wps - np.array([ob.cx, ob.cy], dtype=np.float64)
             if np.min(np.einsum('ij,ij->i', dxy, dxy)) <= thr_sq:
                 kept.append(ob)
@@ -787,7 +936,7 @@ class MPCController(Node):
             self._obstacles_updated = False
             self._map.reset_map()
             filtered_dynamic = self._filter_obstacles_to_corridor(self._dynamic_obstacles)
-            self._map.add_obstacles(self._static_obstacles + filtered_dynamic)
+            self._map.add_obstacles(self._static_obstacles + self._detected_obstacles + filtered_dynamic)
             self._reference_path.reset_dynamic_constraints()
 
         is_colliding = False
@@ -799,22 +948,75 @@ class MPCController(Node):
         pose = odom_to_pose_2d(self._odom) # type: ignore
         v = self._odom.twist.twist.linear.x
 
-        self._car.update_states(pose.x, pose.y, pose.theta)
+        self._car.update_states(pose.x, pose.y, pose.theta, current_speed=v, dt_control=dt)
+
+        # --- TEMP DEBUG: detect wp_id jumps ---
+        if hasattr(self, '_last_wp_id_debug'):
+            jump = abs(self._car.wp_id - self._last_wp_id_debug)
+            n_wp = len(self._car.reference_path.waypoints)
+            wrap_jump = min(jump, n_wp - jump)  # account for path wraparound
+            if wrap_jump > 15:  # tune threshold based on your waypoint spacing
+                self.get_logger().error(
+                    f"WP_ID JUMP DETECTED: {self._last_wp_id_debug} -> {self._car.wp_id} "
+                    f"(jump={wrap_jump}) at pose=({pose.x:.2f}, {pose.y:.2f})")
+        self._last_wp_id_debug = self._car.wp_id
+        # --- END TEMP DEBUG ---
         # print(f"car x: {self._car.temporal_state.x}, y: {self._car.temporal_state.y}, psi: {self._car.temporal_state.psi}")
         # print(f"mpc x: {self._mpc.model.temporal_state.x}, y: {self._mpc.model.temporal_state.y}, psi: {self._mpc.model.temporal_state.psi}")
 
         with self._stats.time_block("control"):
-            u, max_delta = self._mpc.get_control()
+            try:
+                u, max_delta = self._mpc.get_control()
+            except Exception as e:
+                self.get_logger().warn(f"MPC solver fallback: {e}")
+                u = np.array([2.0, 0.0])
+                max_delta = 0.0
             # self.get_logger().info(f"u: {u}")
 
         if self._ref_vel_configulator is not None:
-            ref_vel_mps = self._ref_vel_configulator.get_ref_vel(self._mpc.model.wp_id)
-            ref_vel_kmph = min(
-                kmh_to_m_per_sec(ref_vel_mps),
+            ref_vel_kmph = self._ref_vel_configulator.get_ref_vel(self._mpc.model.wp_id)
+            ref_vel_mps = min(
+                kmh_to_m_per_sec(ref_vel_kmph),
                 self._mpc_cfg.v_max)
-            self._mpc.update_v_max(ref_vel_kmph)
-            v_ref: List[float] = [ref_vel_kmph] * len(self._reference_path.waypoints)
-            self._reference_path.set_v_ref(v_ref)
+            self._mpc.update_v_max(ref_vel_mps)
+
+        # Wall Collision & Off-Track Recovery Detection
+        target_v = u[0] if len(u) > 0 else 2.0
+        e_y = 0.0
+        try:
+            e_y = self._car.reference_path.t2s([pose.x, pose.y, pose.theta])[0]
+        except Exception:
+            e_y = 0.0
+
+        # If vehicle is near raceline center (|e_y| < 0.6m), it CANNOT be stuck against a wall!
+        if abs(e_y) < 0.6:
+            self._stuck_ticks = 0
+        else:
+            # Vehicle is off-center (|e_y| >= 0.6m) AND stopped/slow (|v| < 0.3m/s) while trying to drive forward
+            if self._enable_control and self._loop > 150 and abs(v) < 0.3 and target_v > 1.0:
+                self._stuck_ticks += 1
+            else:
+                self._stuck_ticks = max(0, self._stuck_ticks - 1)
+
+        # Trigger reverse recovery if off-center wall stuck persists for > 100 ticks (2.5 seconds)
+        if self._stuck_ticks > 100 and self._reverse_ticks == 0:
+            self.get_logger().warn(f"WALL STUCK CONFIRMED (e_y={e_y:.2f}m, v={v:.2f}m/s)! Reverse Recovery Active...")
+            self._reverse_ticks = 30  # reverse for 30 ticks (0.75s)
+            self._stuck_ticks = 0
+            self._reverse_steer_dir = -1.0 if e_y > 0 else 1.0
+
+        # Execute reverse recovery
+        if self._reverse_ticks > 0:
+            self._reverse_ticks -= 1
+            self._was_reversing = True
+            u = np.array([-2.0, self._reverse_steer_dir * np.deg2rad(25.0)])
+            max_delta = np.deg2rad(25.0)
+        elif self._was_reversing:
+            self._was_reversing = False
+            self.get_logger().info("Reverse Recovery Completed! Relaunching forward motion...")
+            self._last_u = np.array([2.5, 0.0])
+            self._last_acc = 1.0
+            u[0] = 2.5
 
         # override by brake command if control is disabled
         if not self._enable_control:
@@ -873,9 +1075,11 @@ class MPCController(Node):
         self._sim_logger.log(self._car, u, t)
         self._sim_logger.plot_animation(t, self._loop, self._current_laps, self._lap_times, is_colliding, u, self._mpc, self._car)
 
-        # 約 0.25 秒ごとに予測結果を表示
-        if (self._mpc.current_prediction is not None) and (self._loop % (self._mpc_cfg.control_rate // 4) == 0):
+        # 予測結果およびリファレンスパスの表示
+        if self._mpc.current_prediction is not None:
             self._publish_mpc_pred_marker(self._mpc.current_prediction[0], self._mpc.current_prediction[1]) # type: ignore
+        if self._loop % 80 == 0:
+            self._publish_ref_path_marker(self._car.reference_path)
 
     def run(self) -> None:
         self._wait_until_clock_received()
@@ -885,11 +1089,10 @@ class MPCController(Node):
 
         # initialize car states
         pose = odom_to_pose_2d(self._odom) # type: ignore
-        self._car.update_states(pose.x, pose.y, pose.theta)
+        self._car.update_states(pose.x, pose.y, pose.theta, current_speed=self._odom.twist.twist.linear.x, dt_control=1.0 / self._mpc_cfg.control_rate)
         self._car.update_reference_path(self._car.reference_path)
 
-        if self._ref_vel_configulator is None:
-            self._publish_ref_path_marker(self._car.reference_path)
+        self._publish_ref_path_marker(self._car.reference_path)
 
         self._pred_marker_color = CYAN
 
