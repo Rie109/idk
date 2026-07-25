@@ -30,6 +30,14 @@ $(addprefix simulator-,$(SIM_MODES)): simulator-%:
 autoware-build:
 	docker compose run -T --rm --no-deps autoware-build
 
+# Build only user workspace (faster for MPC code changes)
+workspace-build:
+	docker compose run -T --rm --no-deps autoware-command bash -c "cd /aichallenge/workspace && colcon build --symlink-install"
+
+# Quick rebuild and restart for MPC development
+quick-test: workspace-build down dev autoware-request-initialpose autoware-request-control
+	@echo "Quick test cycle complete"
+
 # run autoware for vehicle
 autoware-vehicle:
 	@echo "Start Autoware for Vehicle"

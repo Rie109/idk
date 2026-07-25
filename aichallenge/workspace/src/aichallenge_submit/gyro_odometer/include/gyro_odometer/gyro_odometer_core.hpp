@@ -35,32 +35,59 @@
 #include <memory>
 #include <string>
 
-class GyroOdometer : public rclcpp::Node
-{
+// ---------- Lightweight 1-D Kalman filter ----------
+struct SimpleKalman1D {
+  double x = 0.0;
+  double P = 1.0;
+  double Q = 0.04;
+  double R = 0.5;
+  bool initialized = false;
+
+  double update(double z, double dt = 1.0) {
+    if (!initialized) {
+      x = z;
+      initialized = true;
+      return x;
+    }
+    // Predict — scale process noise by elapsed time so irregular
+    // publish cadence doesn't silently distort the filter's trust balance
+    P += Q * dt;
+    // Update
+    double K = P / (P + R);
+    x += K * (z - x);
+    P *= (1.0 - K);
+    return x;
+  }
+};
+
+
+class GyroOdometer : public rclcpp::Node {
 private:
   using COV_IDX = tier4_autoware_utils::xyz_covariance_index::XYZ_COV_IDX;
 
 public:
-  explicit GyroOdometer(const rclcpp::NodeOptions & options);
+  explicit GyroOdometer(const rclcpp::NodeOptions &options);
   ~GyroOdometer();
 
 private:
   void callbackVehicleTwist(
-    const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr vehicle_twist_msg_ptr);
+      const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr
+          vehicle_twist_msg_ptr);
   void callbackImu(const sensor_msgs::msg::Imu::ConstSharedPtr imu_msg_ptr);
-  void publishData(const geometry_msgs::msg::TwistWithCovarianceStamped & twist_with_cov_raw);
+  void publishData(
+      const geometry_msgs::msg::TwistWithCovarianceStamped &twist_with_cov_raw);
 
-  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
-    vehicle_twist_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::
+      SharedPtr vehicle_twist_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_raw_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
-    twist_with_covariance_raw_pub_;
+      twist_with_covariance_raw_pub_;
 
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr
-    twist_with_covariance_pub_;
+      twist_with_covariance_pub_;
 
   std::shared_ptr<tier4_autoware_utils::TransformListener> transform_listener_;
 
@@ -69,8 +96,16 @@ private:
 
   bool vehicle_twist_arrived_;
   bool imu_arrived_;
-  std::deque<geometry_msgs::msg::TwistWithCovarianceStamped> vehicle_twist_queue_;
+  std::deque<geometry_msgs::msg::TwistWithCovarianceStamped>
+      vehicle_twist_queue_;
   std::deque<sensor_msgs::msg::Imu> gyro_queue_;
+
+  // Kalman filters for velocity and yaw rate
+  SimpleKalman1D kalman_vx_;
+  SimpleKalman1D kalman_wz_;
+
+  rclcpp::Time last_filter_update_time_;
+  bool filter_time_initialized_ = false;
 };
 
-#endif  // GYRO_ODOMETER__GYRO_ODOMETER_CORE_HPP_
+#endif // GYRO_ODOMETER__GYRO_ODOMETER_CORE_HPP_

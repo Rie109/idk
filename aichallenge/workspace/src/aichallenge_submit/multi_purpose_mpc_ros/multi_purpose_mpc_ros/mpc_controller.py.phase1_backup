@@ -54,10 +54,6 @@ from multi_purpose_mpc_ros.obstacle_manager import ObstacleManager
 from multi_purpose_mpc_ros.exexution_stats import ExecutionStats
 from multi_purpose_mpc_ros_msgs.msg import AckermannControlBoostCommand, PathConstraints, BorderCells
 from multi_purpose_mpc_ros.tools.reference_velocity_configulator import ReferenceVelocityConfigulator
-from multi_purpose_mpc_ros.lidar_road_mapper import LidarRoadMapper
-from multi_purpose_mpc_ros.opponent_tracker import OpponentTracker
-from multi_purpose_mpc_ros.map_path_generator import MapPathGenerator
-from sensor_msgs.msg import PointCloud2
 
 
 RED = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
@@ -201,7 +197,7 @@ def array_to_ackermann_control_command(stamp, u: np.ndarray, acc: float) -> Acke
     msg.stamp = stamp
     msg.lateral.stamp = stamp
     msg.lateral.steering_tire_angle = u[1]
-    msg.lateral.steering_tire_rotation_rate = 0.5
+    msg.lateral.steering_tire_rotation_rate = 2.0
     msg.longitudinal.stamp = stamp
     msg.longitudinal.speed = u[0]
     msg.longitudinal.acceleration = acc
@@ -289,42 +285,6 @@ class MPCController(Node):
         self._odom: Optional[Odometry] = None
         self._enable_control = True
         self._initialize()
-        
-        # Initialize Phase 1 Lidar-based systems BEFORE setup_pub_sub
-        self._use_lidar_constraints = getattr(self._cfg.mpc, 'use_lidar_constraints', False)
-        self._use_map_path_generation = getattr(self._cfg.mpc, 'use_map_path_generation', False)
-        
-        self._lidar_mapper = LidarRoadMapper(
-            map_resolution=0.1,
-            max_range=50.0,
-            update_rate=10.0
-        )
-        self._opponent_tracker = OpponentTracker(
-            max_opponents=10,
-            prediction_horizon=2.0,
-            update_rate=20.0
-        )
-        
-        # Initialize Phase 2 Map-based path generator
-        self._map_path_generator = None
-        if self._use_map_path_generation and self._map is not None:
-            self._map_path_generator = MapPathGenerator(
-                map_obj=self._map,
-                resolution=0.5,
-                smoothing_distance=3.0
-            )
-            self.get_logger().warn("MAP-BASED PATH GENERATION ENABLED")
-        
-        # Lidar data storage
-        self._latest_lidar_data = None
-        self._lidar_data_timestamp = 0.0
-        
-        if self._use_lidar_constraints:
-            self._lidar_mapper.enable_lidar_constraints(True)
-            self._opponent_tracker.enable_tracking(True)
-            self.get_logger().warn("LIDAR-BASED CONSTRAINTS ENABLED")
-            self.get_logger().warn("Subscribing to Lidar topics for dynamic constraints")
-        
         self._setup_parameters_callback()
         self._setup_pub_sub()
         
@@ -756,12 +716,12 @@ class MPCController(Node):
                 # Straight road - use max speed
                 adjusted_speed = min(section_speed_ms, v_max_kappa)
             elif road_condition == "yellow":
-                # Moderate curve
-                reduction_factor = 1.15
+                # Moderate curve - reduce speed by 5-10%
+                reduction_factor = np.random.uniform(0.90, 0.95)  # 5-10% reduction
                 adjusted_speed = min(section_speed_ms, v_max_kappa) * reduction_factor
             else:  # red
-                # Sharp curve
-                reduction_factor = 1.25 
+                # Sharp curve - reduce speed by 10-15%
+                reduction_factor = np.random.uniform(0.85, 0.90)  # 10-15% reduction
                 adjusted_speed = min(section_speed_ms, v_max_kappa) * reduction_factor
             
             v_ref.append(adjusted_speed)
@@ -806,101 +766,23 @@ class MPCController(Node):
                 prev_i = (i - 1) % n if is_circular else max(i - 1, 0)
                 dist = np.hypot(waypoints[i].x - waypoints[prev_i].x, waypoints[i].y - waypoints[prev_i].y)
                 
-                # Dynamic acceleration based on road condition (currently set to 1.0 for testing max limits)
+                # Dynamic acceleration based on road condition
                 current_condition = road_conditions[i] if i < len(road_conditions) else 'green'
                 if current_condition == 'green':
-                    # Straight road
+                    # Straight road - max acceleration
                     dynamic_accel = max_accel
                 elif current_condition == 'yellow':
-                    # Moderate curve
-                    dynamic_accel = max_accel * 1.0
+                    # Moderate curve - reduce acceleration by 5-10%
+                    dynamic_accel = max_accel * np.random.uniform(0.90, 0.95)
                 else:  # red
-                    # Sharp curve
-                    dynamic_accel = max_accel * 1.0
+                    # Sharp curve - reduce acceleration by 10-15% (more conservative)
+                    dynamic_accel = max_accel * np.random.uniform(0.85, 0.90)
                 
                 max_reachable = np.sqrt(
                     waypoints[prev_i].v_ref**2 + 2 * dynamic_accel * dist
                 )
                 waypoints[i].v_ref = min(curvature_ceiling[i], max_reachable)
 
-    def _update_reference_path(self) -> None:
-        """Update reference path from map if enabled, otherwise use CSV."""
-        if self._use_map_path_generation and self._map_path_generator is not None:
-            self._generate_map_based_path()
-        else:
-            # Use existing CSV path
-            pass
-    
-    def _generate_map_based_path(self) -> None:
-        """Generate racing line from map data."""
-        try:
-            # Get current vehicle position as start
-            if self._car.temporal_state is not None:
-                start_pos = (self._car.temporal_state.x, self._car.temporal_state.y)
-            else:
-                start_pos = (0.0, 0.0)
-            
-            # Generate racing line from map
-            world_path = self._map_path_generator.generate_racing_line(start_pos)
-            
-            if len(world_path) > 0:
-                # Generate waypoints with curvature
-                waypoints = self._map_path_generator.generate_waypoints(world_path)
-                
-                if len(waypoints) > 0:
-                    # Update reference path with map-generated waypoints
-                    self.get_logger().info(f"Generated map-based path with {len(waypoints)} waypoints")
-                    # Note: This would require updating the reference path structure
-                    # For now, just log that generation succeeded
-                    
-        except Exception as e:
-            self.get_logger().error(f"Map-based path generation failed: {e}")
-            self.get_logger().warn("Falling back to CSV path")
-    
-    def _process_lidar_data(self, now):
-        """Process Lidar data for dynamic constraints (Phase 1)."""
-        if not self._use_lidar_constraints:
-            return
-        
-        # Check if we have recent Lidar data
-        current_time = now.nanoseconds / 1e9
-        if self._latest_lidar_data is None or (current_time - self._lidar_data_timestamp) > 0.5:
-            self.get_logger().warn("No recent Lidar data available, using CSV fallback")
-            return
-        
-        # Process Lidar data
-        vehicle_pose = (self._car.temporal_state.x, self._car.temporal_state.y, self._car.temporal_state.psi)
-        
-        try:
-            # Process for road mapping
-            road_constraints = self._lidar_mapper.process_lidar_scan(self._latest_lidar_data, vehicle_pose)
-            
-            # Process for opponent tracking
-            opponent_constraints = self._opponent_tracker.process_sensor_data(self._latest_lidar_data, vehicle_pose)
-            
-            # Log processing results
-            if self._loop % 50 == 0:
-                self.get_logger().info(f"Lidar processing: {len(road_constraints['obstacles'])} obstacles, "
-                                     f"{len(opponent_constraints['opponents'])} opponents detected")
-                
-        except Exception as e:
-            self.get_logger().error(f"Lidar processing failed: {e}")
-    
-    def _lidar_callback(self, msg: PointCloud2):
-        """Callback for Lidar point cloud data."""
-        try:
-            # Convert PointCloud2 to numpy array
-            import sensor_msgs_py.point_cloud2 as pc2
-            points = pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
-            self._latest_lidar_data = np.array(list(points))
-            self._lidar_data_timestamp = self.get_clock().now().nanoseconds / 1e9
-            
-            if self._loop % 100 == 0:
-                self.get_logger().info(f"Received Lidar scan with {len(self._latest_lidar_data)} points")
-                
-        except Exception as e:
-            self.get_logger().error(f"Lidar callback failed: {e}")
-    
     def _save_config(self) -> None:
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         dst_dir = self.PKG_PATH + f"log/{now}"
@@ -943,13 +825,6 @@ class MPCController(Node):
         # Subscribers
         self._odom_sub = self.create_subscription(
             Odometry, "/localization/kinematic_state", self._odom_callback, 1)
-        
-        # Phase 1: Subscribe to Lidar if enabled
-        if self._use_lidar_constraints:
-            self._lidar_sub = self.create_subscription(
-                PointCloud2, "/sensing/lidar/top/pointcloud_raw", self._lidar_callback, 10)
-            self.get_logger().info("Subscribed to Lidar topic: /sensing/lidar/top/pointcloud_raw")
-        
         self._control_mode_request_sub = self.create_subscription(
             Bool, "/awsim/control_mode_request_topic", self._control_mode_request_callback, 1)
         self._control_mode_request_sub_alt = self.create_subscription(
@@ -995,7 +870,7 @@ class MPCController(Node):
                 1)
 
     def _create_ackerman_control_command(self, stamp, u, acc, bug_acc_enabled):
-        v_cmd = abs(u[0]) if u[0] < -0.1 else u[0]
+        v_cmd = u[0]
         steer_cmd = u[1]
 
         ackerman_cmd = array_to_ackermann_control_command(stamp.to_msg(), [v_cmd, steer_cmd], acc)
@@ -1028,13 +903,10 @@ class MPCController(Node):
         if hasattr(self, '_ackermann_pub'):
             self._ackermann_pub.publish(cmd)
 
-        # Publish gear command (DRIVE=2, REVERSE=20)
+        # Publish gear command (DRIVE=2)
         gear_msg = GearCommand()
         gear_msg.stamp = stamp.to_msg()
-        if u[0] < -0.1:
-            gear_msg.command = 20  # GearCommand.REVERSE
-        else:
-            gear_msg.command = GearCommand.DRIVE
+        gear_msg.command = GearCommand.DRIVE
         self._gear_pub.publish(gear_msg)
 
         # Periodically publish control mode request (AUTONOMOUS=True)
@@ -1132,10 +1004,10 @@ class MPCController(Node):
         if self._last_condition is None:
             self._last_condition = msg.data
 
-        diff_condition = abs(msg.data - self._last_condition)
-        if diff_condition > 0:
+        diff_condition = msg.data - self._last_condition
+        if diff_condition > 30.0:
             self._last_colliding_time = self.get_clock().now()
-            self.get_logger().warning(f"Collision detected! Condition changed by {diff_condition}")
+            self.get_logger().warning(f"Collision detected!")
         self._last_condition = msg.data
 
     def _stop_request_callback(self, msg: Empty) -> None:
@@ -1348,34 +1220,18 @@ class MPCController(Node):
         is_colliding = False
         if self.USE_OBSTACLE_AVOIDANCE:
             if self._car.is_colliding(self._static_obstacles):
-                if not hasattr(self, '_last_colliding_time_static') or self._last_colliding_time_static is None:
-                    self._last_colliding_time_static = now
-                elif (now - self._last_colliding_time_static).nanoseconds / 1e9 > 0.5:
+                if self._last_colliding_time is None:
+                    self._last_colliding_time = now
+                elif (now - self._last_colliding_time).nanoseconds / 1e9 > 0.5:
                     is_colliding = True
             else:
-                self._last_colliding_time_static = None
-
-        if self._last_colliding_time is not None:
-            if (now - self._last_colliding_time).nanoseconds / 1e9 < 2.0:
-                is_colliding = True
-
-        # Phase 1: Process Lidar data if available
-        if self._use_lidar_constraints and hasattr(self, '_lidar_mapper'):
-            self._process_lidar_data(now)
+                self._last_colliding_time = None
 
         # Update obstacle map for MPC corridor computation
         if self.USE_OBSTACLE_AVOIDANCE and self._obstacles_updated:
             self._obstacles_updated = False
             self._map.reset_map()
             filtered_dynamic = self._filter_obstacles_to_corridor(self._dynamic_obstacles)
-            
-            # Add Lidar-based dynamic obstacles if available
-            if self._use_lidar_constraints and hasattr(self, '_lidar_mapper'):
-                lidar_constraints = self._lidar_mapper.get_dynamic_constraints()
-                for obstacle in lidar_constraints['obstacles']:
-                    # Convert Lidar obstacles to obstacle format
-                    self._map.add_obstacles([Obstacle(obstacle['x'], obstacle['y'], obstacle['radius'])])
-            
             self._map.add_obstacles(self._static_obstacles + self._detected_obstacles + filtered_dynamic)
             self._reference_path.reset_dynamic_constraints()
 
@@ -1393,61 +1249,6 @@ class MPCController(Node):
         current_y = self._car.temporal_state.y
         current_yaw = self._car.temporal_state.psi
         current_v = self._car.temporal_state.v if hasattr(self._car.temporal_state, 'v') else v
-
-        # Stuck detection
-        if not hasattr(self, '_last_pose_for_stuck'):
-            self._last_pose_for_stuck = (current_x, current_y)
-            
-        dist_moved = math.hypot(current_x - self._last_pose_for_stuck[0], current_y - self._last_pose_for_stuck[1])
-        self._last_pose_for_stuck = (current_x, current_y)
-        
-        if dist_moved > 1.0:
-            # Teleportation (Place Kart) detected. Give a 5-second grace period to allow the 
-            # 3-second race countdown to finish without falsely triggering reverse recovery.
-            self._stuck_ticks = -int(self._mpc_cfg.control_rate * 5.0)
-        else:
-            is_stuck = False
-            if abs(current_v) < 0.2:
-                # Vehicle is barely moving despite having throttle commands
-                if len(u) > 0 and abs(u[0]) > 0.5:
-                    is_stuck = True
-                elif hasattr(self, '_last_acc') and self._last_acc > 0.5:
-                    is_stuck = True
-                    
-            if is_stuck:
-                self._stuck_ticks += 1
-            else:
-                self._stuck_ticks = max(0, self._stuck_ticks - 1)
-
-        # Trigger recovery if stuck for ~1.0s
-        if self._stuck_ticks > int(self._mpc_cfg.control_rate * 0.5):
-            self._reverse_ticks = int(self._mpc_cfg.control_rate * 0.5)
-            self._stuck_ticks = 0
-            
-            # Find best reverse steering direction
-            closest_idx = self._car.get_closest_waypoint(current_x, current_y)
-            wp = self._reference_path.get_waypoint(closest_idx)
-            dx = current_x - wp.x
-            dy = current_y - wp.y
-            e_y = -np.sin(wp.psi) * dx + np.cos(wp.psi) * dy
-            self._reverse_steer_dir = self._evaluate_best_recovery_steer(current_x, current_y, current_yaw, e_y)
-            self.get_logger().warn("Kart is stuck! Initiating reverse recovery...")
-
-        # Apply recovery
-        is_reversing = False
-        if self._reverse_ticks > 0:
-            is_reversing = True
-            # Reverse at -2.5 m/s, max steer
-            u = np.array([-2.5, self._reverse_steer_dir * np.deg2rad(25.0)])
-            self._reverse_ticks -= 1
-            if self._reverse_ticks == 0:
-                self._realign_ticks = int(self._mpc_cfg.control_rate * 1.0)
-        elif self._realign_ticks > 0:
-            # Realign phase: Forward at 2.5 m/s, opposite steer
-            u = np.array([2.5, -self._reverse_steer_dir * np.deg2rad(25.0)])
-            self._realign_ticks -= 1
-
-        self._was_reversing = is_reversing
         
         # Update friction estimator
         lateral_accel = 0.0  # Simplified, could be computed from steering and velocity
@@ -1502,18 +1303,7 @@ class MPCController(Node):
                 acc = 500.0
         else:
             # Closed-loop speed tracking: acc = KP * (v_target - v_actual)
-            # Use absolute speeds so that we apply positive throttle even in reverse gear
-            target_speed = abs(u[0])
-            actual_speed = abs(v)
-            
-            # If we're reversing but the car is rolling forward, we might need to brake first, 
-            # but for simplicity let's just use the absolute error for throttle/brake.
-            if u[0] < -0.1 and v > 0.5:
-                # We want to go backward but we're moving forward -> brake hard
-                acc = self._mpc_cfg.a_min
-            else:
-                acc = self.KP * (target_speed - actual_speed)
-                
+            acc = self.KP * (u[0] - v)
             acc = np.clip(acc, self._mpc_cfg.a_min, self._mpc_cfg.a_max)
 
         # apply low pass filter to control signal

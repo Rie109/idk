@@ -40,13 +40,15 @@ mpc:
   R: [0.0, 300.0]      # [v, delta]
   QN: [3.0, 1.5, 5.0]
   v_max: 30.0 # km/h
-  a_min: -3.2 # m/s^2
-  a_max: 3.2 # m/s^2
+  a_min: -1.6 # m/s^2
+  a_max: 0.8 # m/s^2
   ay_max: 50.0 # m/s^2, maximum lateral acceleration in curves
   delta_max_deg: 80.0 # degrees
   control_rate: 50.0 # Hz
   steering_tire_angle_gain_var: 1.0
   wp_id_offset: 0
+  raceline_blend_ratio: 0.65
+  friction_coefficient: 0.9
 
 v2x_obstacle_avoidance:
   vehicle_radius: 0.5          # [m]

@@ -292,7 +292,7 @@ void TeleopManagerNode::timer_callback()
     out.longitudinal.acceleration = joy_speed_;
     out.lateral.steering_tire_angle = joy_steer_;
     out.lateral.steering_tire_rotation_rate = 1.0;
-  } else if (ack_active_) {
+  } else if (ack_active_ || ack_received_) {
     out = last_autonomy_msg_;
     out.lateral.steering_tire_rotation_rate = 0.5;
   } else {

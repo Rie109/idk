@@ -39,41 +39,32 @@ bicycle_model:
   width: 2.50   # Increased safety margin to prevent crashing
 
 mpc:
-  N: 20
+  N: 25   # 15m horizon
   # Q: [e_y, e_psi, t]
   # R: [v, delta]
   # QN: [e_y, e_psi, t]
-  R: [100000.0, 100000.0]
-  a_min: -3.0 # m/s^2 (Stronger braking to prevent crashing at high speeds)
-  a_max: 3.0 # m/s^2 (Boosted acceleration for much better speed, staying below 5.0 limit)
+  R: [100000.0, 25000.0]  # Increased steering penalty to strongly dampen wobbles and smoothen curve entry
+  a_min: -3.0 # m/s^2
+  a_max: 1.8 # m/s^2 (increased acceleration on straights)
   delta_max_deg: 32.0 # degrees
-  steer_rate_max: 1.4 # rad/s 
+  steer_rate_max: 0.35 # rad/s
   control_rate: 40.0 # Hz
-  steering_tire_angle_gain_var: 1.1 # (Reduced from 1.9 to stop the kart from wobbling)
-  accel_low_pass_gain: 1.0
-  steer_low_pass_gain: 1.0
+  steering_tire_angle_gain_var: 1.639
+  accel_low_pass_gain: 0.8
+  steer_low_pass_gain: 0.35  # Smooth out 40Hz solver noise to eliminate front-wheel wobbling
   wp_id_offset: 2
   use_max_kappa_pred: true
-  raceline_blend_ratio: 0.9  # Slightly reduced for adaptive racing lines
-  friction_coefficient: 0.95  # Increased for high-speed grip
-  dynamic_acceleration: true  # Enable dynamic acceleration based on road conditions
-  use_lidar_constraints: false  # Phase 1: Disabled - Lidar topic has no data in simulation
-  use_map_path_generation: false  # Phase 2: Disabled due to cv2/NumPy dependency issues
+  raceline_blend_ratio: 1.0  # 1.0 = Track exact smooth CSV line (e_y = 0.0) for consistency and no wobbling
+  friction_coefficient: 0.9
 
-  ## ------------------- 究極 ------------------- ##
-  ## Lap1: 53s, Lap2: 47s
 
-  v_max: 50.0  # km/h (Capped around 30 km/h as requested)
-  ay_max: 15.0 # m/s^2 (Reduced to 5.0 to prevent OVER penalty)
-  Q: [600000.0, 80000000.0, 2000000.0]
-  QN: [1000000.0, 1000000.0, 10000.0]
+  ## --- 中高速 (ACTIVE - High acceleration, 32 km/h max, safe cornering) --- ##
+  ## Lap1: 54s, Lap2: 48s
 
-  ## --- HIGH SPEED (30-35 km/h target, smoother curves) --- ##
-  
-  # v_max: 32.0
-  # ay_max: 8.5
-  # Q: [2500000.0, 100000000.0, 100000.0]
-  # QN: [1000000.0, 1000.0, 10000.0]
+  v_max: 32.0
+  ay_max: 8.5
+  Q: [3000000.0, 90000000.0, 100000.0]
+  QN: [1000000.0, 1000.0, 10000.0]
 
   ## --- 高速 (gnss delay 0.4) --- ##
   ## Lap1: 55s, Lap2: 49s

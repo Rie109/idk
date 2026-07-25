@@ -53,7 +53,18 @@ class ReferenceVelocityConfigulator():
     def _load_config(cls, config_path: str) -> Dict:
         with open(config_path, "r") as f:
             cfg: Dict = yaml.safe_load(f) # type: ignore
-        return cfg["ref_vel_configulator"]
+        if "ref_vel_configulator" in cfg:
+            return cfg["ref_vel_configulator"]
+        elif "ref_vel" in cfg:
+            raw = cfg["ref_vel"]
+            res = {}
+            for i, (k, v) in enumerate(raw.items()):
+                if isinstance(v, dict):
+                    res[k] = v
+                else:
+                    res[k] = {"ref_vel": float(v), "wp_id": i * 5}
+            return res
+        return cfg
 
     def _register_params(self):
         def declatre_parameters():

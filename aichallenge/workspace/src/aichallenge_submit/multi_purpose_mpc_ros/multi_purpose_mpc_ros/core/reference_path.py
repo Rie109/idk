@@ -261,14 +261,26 @@ class ReferencePath:
         wp_y = [wp for segment in wp_y for wp in segment] + [gp_y]
 
         # Smooth path
-        wp_xs = []
-        wp_ys = []
-        for wp_id in range(self.smoothing_distance, len(wp_x) -
-                                                    self.smoothing_distance):
-            wp_xs.append(np.mean(wp_x[wp_id - self.smoothing_distance:wp_id
-                                            + self.smoothing_distance + 1]))
-            wp_ys.append(np.mean(wp_y[wp_id - self.smoothing_distance:wp_id
-                                            + self.smoothing_distance + 1]))
+        try:
+            from scipy.signal import savgol_filter
+            window_size = 2 * self.smoothing_distance + 1
+            if window_size > 3:
+                filter_mode = 'wrap' if self.circular else 'interp'
+                wp_xs = savgol_filter(wp_x, window_size, polyorder=3, mode=filter_mode).tolist()
+                wp_ys = savgol_filter(wp_y, window_size, polyorder=3, mode=filter_mode).tolist()
+                wp_xs = wp_xs[self.smoothing_distance : len(wp_x) - self.smoothing_distance]
+                wp_ys = wp_ys[self.smoothing_distance : len(wp_y) - self.smoothing_distance]
+            else:
+                raise ValueError("Window size too small for Savitzky-Golay filter")
+        except Exception:
+            wp_xs = []
+            wp_ys = []
+            for wp_id in range(self.smoothing_distance, len(wp_x) -
+                                                        self.smoothing_distance):
+                wp_xs.append(np.mean(wp_x[wp_id - self.smoothing_distance:wp_id
+                                                + self.smoothing_distance + 1]))
+                wp_ys.append(np.mean(wp_y[wp_id - self.smoothing_distance:wp_id
+                                                + self.smoothing_distance + 1]))
 
         # Construct list of waypoint objects
         waypoints = list(zip(wp_xs, wp_ys))
