@@ -20,6 +20,11 @@ from std_msgs.msg import Bool
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
+try:
+    from autoware_auto_vehicle_msgs.msg import GearCommand
+except ImportError:
+    GearCommand = None
+
 
 _DashboardPayload = tuple[str, str, Optional[str], bool, bool, str, str]
 
@@ -135,6 +140,10 @@ class AutostartOrchestrator(Node):
         self._pub_control_mode = self.create_publisher(
             Bool, str(self.get_parameter("control_mode_request_topic").value), 1
         )
+        if GearCommand is not None:
+            self._pub_gear = self.create_publisher(GearCommand, "/control/command/gear_cmd", 1)
+        else:
+            self._pub_gear = None
 
         self._capture_started = False
         self._rosbag_proc: Optional[subprocess.Popen] = None
@@ -484,8 +493,18 @@ class AutostartOrchestrator(Node):
             # and the trigger call only gets the remainder.
             deadline = None if timeout_arg is None else time.monotonic() + timeout_arg
             if self._wait_for_service(self._cli_initial_pose, timeout_sec=timeout_arg):
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                ok, msg = self._call_trigger(self._cli_initial_pose, timeout_sec=remaining)
+                ok = False
+                msg = "no_response"
+                # Retry calling set_initial_pose until success or deadline (wait for GNSS ready)
+                while deadline is None or time.monotonic() < deadline:
+                    remaining = None if deadline is None else max(0.1, deadline - time.monotonic())
+                    call_timeout = 2.0 if remaining is None else min(2.0, remaining)
+                    ok, msg = self._call_trigger(self._cli_initial_pose, timeout_sec=call_timeout)
+                    if ok:
+                        break
+                    self.get_logger().info(f"waiting for GNSS/initial pose ready... ({msg})")
+                    time.sleep(0.5)
+
                 if ok:
                     self.get_logger().info(f"initial pose: success={ok} msg={msg}")
                 else:
@@ -550,7 +569,15 @@ class AutostartOrchestrator(Node):
 
         msg = Bool()
         msg.data = True
-        self._pub_control_mode.publish(msg)
+        gear_msg = GearCommand() if GearCommand is not None else None
+        if gear_msg is not None:
+            gear_msg.stamp = self.get_clock().now().to_msg()
+            gear_msg.command = GearCommand.DRIVE
+        for _ in range(5):
+            self._pub_control_mode.publish(msg)
+            if self._pub_gear is not None and gear_msg is not None:
+                self._pub_gear.publish(gear_msg)
+            time.sleep(0.1)
         return True, f"published to {topic} data={msg.data}"
 
     def _output_dir(self) -> Path:
@@ -1062,7 +1089,8 @@ class AutostartOrchestrator(Node):
             enable_capture = bool(self.get_parameter("enable_capture").value)
             self._finalize_recordings(enable_rosbag, enable_capture, enable_motion_analytics)
         finally:
-            return super().destroy_node()
+            res = super().destroy_node()
+        return res
 
 
 def main() -> int:
@@ -1083,7 +1111,7 @@ def main() -> int:
         if worker is not None and worker.is_alive():
             worker.join(timeout=5.0)
         exit_code = max(exit_code, int(getattr(node, "exit_code", 0)))
-        return exit_code
+    return exit_code
 
 
 if __name__ == "__main__":

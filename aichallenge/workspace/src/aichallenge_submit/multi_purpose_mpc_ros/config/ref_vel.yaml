@@ -1,31 +1,76 @@
 ref_vel_configulator:
-  s1:
-    ref_vel: 30.0
-    wp_id: 1
-  s1_1:
-    ref_vel: 30.0
+  section_0:
+    ref_vel: 45.0
+    wp_id: 0
+  section_1:
+    ref_vel: 45.0
+    wp_id: 5
+  section_2:
+    ref_vel: 45.0
+    wp_id: 10
+  section_3:
+    ref_vel: 45.0
+    wp_id: 15
+  section_4:
+    ref_vel: 45.0
+    wp_id: 20
+  section_5:
+    ref_vel: 45.0
+    wp_id: 25
+  section_6:
+    ref_vel: 45.0
     wp_id: 30
-  s2:
-    ref_vel: 30.0
+  section_7:
+    ref_vel: 45.0
+    wp_id: 35
+  section_8:
+    ref_vel: 45.0
+    wp_id: 40
+  section_9:
+    ref_vel: 45.0
+    wp_id: 45
+  section_10:
+    ref_vel: 45.0
+    wp_id: 50
+  section_11:
+    ref_vel: 45.0
     wp_id: 55
-  s3:
-    ref_vel: 30.0
+  section_12:
+    ref_vel: 45.0
+    wp_id: 60
+  section_13:
+    ref_vel: 45.0
+    wp_id: 65
+  section_14:
+    ref_vel: 45.0
+    wp_id: 70
+  section_15:
+    ref_vel: 45.0
+    wp_id: 75
+  section_16:
+    ref_vel: 45.0
+    wp_id: 80
+  section_17:
+    ref_vel: 45.0
+    wp_id: 85
+  section_18:
+    ref_vel: 45.0
+    wp_id: 90
+  section_19:
+    ref_vel: 45.0
+    wp_id: 95
+  section_20:
+    ref_vel: 45.0
     wp_id: 100
-  s4:
-    ref_vel: 22.0
-    wp_id: 155
-  s5:
-    ref_vel: 30.0
-    wp_id: 190
-  s6:
-    ref_vel: 22.0
-    wp_id: 265
-  s7:
-    ref_vel: 30.0
-    wp_id: 290
-  s8:
-    ref_vel: 25.0
-    wp_id: 320
-  s9:
-    ref_vel: 30.0
-    wp_id: 335
+  section_21:
+    ref_vel: 45.0
+    wp_id: 105
+  section_22:
+    ref_vel: 45.0
+    wp_id: 110
+  section_23:
+    ref_vel: 45.0
+    wp_id: 115
+  section_24:
+    ref_vel: 45.0
+    wp_id: 120

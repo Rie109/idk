@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5.0)
 project(multi_purpose_mpc_ros)
 
-# Default to C++23
+# Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,7 @@ install(PROGRAMS
   scripts/mpc_simulation
   scripts/obstacle_parser.py
   scripts/path_constraints_provider
+  scripts/opponent_predictor
   scripts/publish_initialpose
   scripts/publish_initialpose_gnss
   scripts/reference_path_visualizer
@@ -45,23 +46,25 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# create python virtual environment
-execute_process(
-  COMMAND /usr/bin/python3 -m venv ${CMAKE_INSTALL_PREFIX}/.venv
-  RESULT_VARIABLE venv_result
-)
-if(venv_result)
-    message(FATAL_ERROR "Failed to create virtual environment")
-endif()
+# create python virtual environment with system site packages enabled if not already created
+if(NOT EXISTS ${CMAKE_INSTALL_PREFIX}/.venv/bin/python)
+  execute_process(
+    COMMAND /usr/bin/python3 -m venv --system-site-packages ${CMAKE_INSTALL_PREFIX}/.venv
+    RESULT_VARIABLE venv_result
+  )
+  if(venv_result)
+      message(FATAL_ERROR "Failed to create virtual environment")
+  endif()
 
-# install python dependencies in virtual environment
-execute_process(
-    COMMAND ${CMAKE_INSTALL_PREFIX}/.venv/bin/pip install -r ./resources/requirements.txt
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    RESULT_VARIABLE install_result
-)
-if(install_result)
-    message(FATAL_ERROR "Failed to install python dependencies in virtual environment")
+  # install python dependencies in virtual environment (prefer pre-compiled wheels)
+  execute_process(
+      COMMAND ${CMAKE_INSTALL_PREFIX}/.venv/bin/pip install --prefer-binary -r ./resources/requirements.txt
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      RESULT_VARIABLE install_result
+  )
+  if(install_result)
+      message(FATAL_ERROR "Failed to install python dependencies in virtual environment")
+  endif()
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE
@@ -70,4 +73,5 @@ ament_auto_package(INSTALL_TO_SHARE
   env
   resources
   include
+  multi_purpose_mpc_ros
 )

@@ -664,7 +664,7 @@ def main() -> int:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        return exit_code
+    return exit_code
 
 
 if __name__ == "__main__":
