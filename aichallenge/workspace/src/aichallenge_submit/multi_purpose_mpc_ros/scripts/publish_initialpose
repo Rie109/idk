@@ -1,21 +1,59 @@
 #!/usr/bin/env python3
 
+import csv
+import math
+import os
 import sys
 import time
+import yaml
 
 # ROS 2
 import rclpy
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from ament_index_python.packages import get_package_share_directory
 
 
-def main(argv = sys.argv) -> None:
+def load_start_pose_from_csv(csv_path: str):
+    with open(csv_path, 'r') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        row = next(reader)
+        # s_m, x_m, y_m, psi_rad, ...
+        x = float(row[1])
+        y = float(row[2])
+        psi = float(row[3])
+        return x, y, psi
 
+
+def get_reference_csv_path() -> str:
+    pkg_dir = get_package_share_directory('multi_purpose_mpc_ros')
+    config_path = os.path.join(pkg_dir, 'config', 'config.yaml')
+
+    csv_rel_path = "env/final_ver3/traj_mincurv.csv"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f)
+                csv_rel_path = cfg.get('reference_path', {}).get('csv_path', csv_rel_path)
+        except Exception:
+            pass
+
+    full_path = os.path.join(pkg_dir, csv_rel_path)
+    if not os.path.exists(full_path):
+        # Fallback to direct workspace path
+        full_path = "/home/harry_ngyx/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/env/final_ver3/traj_mincurv.csv"
+
+    return full_path
+
+
+def main(argv=sys.argv) -> None:
     rclpy.init(args=argv)
 
     try:
         node = rclpy.create_node('initialpose_pub_node')
         pub = node.create_publisher(PoseWithCovarianceStamped, '/localization/initial_pose3d', 1)
+        pub_initialpose = node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
 
         # set use_sim_time parameter
         param = Parameter("use_sim_time", Parameter.Type.BOOL, True)
@@ -24,29 +62,44 @@ def main(argv = sys.argv) -> None:
         # wait for clock received
         rclpy.spin_once(node, timeout_sec=1)
 
-        while rclpy.ok() and pub.get_subscription_count() == 0:
+        while rclpy.ok() and pub.get_subscription_count() == 0 and pub_initialpose.get_subscription_count() == 0:
             node.get_logger().info("Waiting for subscriber...")
             time.sleep(0.5)
+
+        csv_path = get_reference_csv_path()
+        try:
+            x, y, psi = load_start_pose_from_csv(csv_path)
+            node.get_logger().info(f"Loaded start pose from CSV ({csv_path}): x={x:.2f}, y={y:.2f}, psi={math.degrees(psi):.1f}deg")
+        except Exception as e:
+            node.get_logger().error(f"Failed to read CSV start pose from {csv_path}: {e}, using default")
+            x, y, psi = 89656.8036175, 43128.8719252, 2.9152365
+
+        # Compute quaternion for planar yaw psi
+        z_quat = math.sin(psi / 2.0)
+        w_quat = math.cos(psi / 2.0)
 
         # create initialpose message
         initialpose = PoseWithCovarianceStamped()
         initialpose.header.stamp = node.get_clock().now().to_msg()
         initialpose.header.frame_id = 'map'
-        initialpose.pose.pose.position.x = 89633.29
-        initialpose.pose.pose.position.y = 43127.57
+        initialpose.pose.pose.position.x = x
+        initialpose.pose.pose.position.y = y
         initialpose.pose.pose.position.z = 0.0
-        initialpose.pose.pose.orientation.x= 0.0
-        initialpose.pose.pose.orientation.y= -0.0
-        initialpose.pose.pose.orientation.z= 0.8778
-        initialpose.pose.pose.orientation.w= 0.4788
+        initialpose.pose.pose.orientation.x = 0.0
+        initialpose.pose.pose.orientation.y = 0.0
+        initialpose.pose.pose.orientation.z = z_quat
+        initialpose.pose.pose.orientation.w = w_quat
         initialpose.pose.covariance[0] = 0.25
         initialpose.pose.covariance[7] = 0.25
         initialpose.pose.covariance[35] = 0.06853891909122467
 
-        # publish initialpose
+        # publish initialpose to both /localization/initial_pose3d and /initialpose
         for _ in range(5):
             pub.publish(initialpose)
+            pub_initialpose.publish(initialpose)
             time.sleep(0.2)
+
+        node.get_logger().info("Initial pose published successfully!")
 
     except KeyboardInterrupt:
         node.get_logger().info("Shutdown requested")
